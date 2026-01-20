@@ -6,7 +6,7 @@
 |------|------|------|
 | 阶段一：基础设施搭建 | ✅ 已完成 | 100% |
 | 阶段二：Kibana MCP Server | ✅ 已完成 | 100% |
-| 阶段三：Archery MCP Server | ⏳ 待开始 | 0% |
+| 阶段三：Archery MCP Server | ✅ 已完成 | 100% |
 | 阶段四：Doris MCP Server | ⏳ 待开始 | 0% |
 | 阶段五：Claude Code 集成 | ✅ 已完成 | 100% |
 | 阶段六：自动化扩展 | ⏳ 待开始 | 0% |
@@ -53,14 +53,20 @@
 
 ### 阶段三：Archery MCP Server
 
-- [ ] 实现 ArcheryClient 认证登录
-- [ ] 测试登录功能
-- [ ] 实现 sql_check 工具
-- [ ] 实现 query_execute 工具
-- [ ] 实现 get_instances 工具
-- [ ] 创建 MCP Server 入口
-- [ ] 单元测试
-- [ ] 集成测试
+- [x] 实现 ArcheryClient 认证登录
+  - 支持 Django Session 认证
+  - 支持 CSRF Token 处理
+  - 支持 API Token 认证（备选）
+- [x] 实现 get_instances 工具
+- [x] 实现 get_databases 工具
+- [x] 实现 query_execute 工具（只读 SELECT）
+- [x] 实现 sql_check 工具
+- [x] 实现 sql_review 工具
+- [x] 实现 get_workflow_list 工具
+- [x] 实现 get_workflow_detail 工具
+- [x] 实现 get_query_history 工具
+- [x] 创建 MCP Server 入口
+- [ ] 集成测试（需内网环境）
 
 ### 阶段四：Doris MCP Server
 
@@ -102,9 +108,12 @@ mcp-devops-tools/
 │   │   ├── __init__.py
 │   │   ├── __main__.py
 │   │   ├── client.py      # Kibana 客户端（认证、查询）
-│   │   └── server.py      # MCP Server（6个工具）
+│   │   └── server.py      # MCP Server（8个工具）
 │   ├── archery/
-│   │   └── __init__.py
+│   │   ├── __init__.py
+│   │   ├── __main__.py
+│   │   ├── client.py      # Archery 客户端（认证、SQL操作）
+│   │   └── server.py      # MCP Server（8个工具）
 │   └── doris/
 │       └── __init__.py
 ├── common/
@@ -120,6 +129,25 @@ mcp-devops-tools/
 ---
 
 ## 更新日志
+
+### 2026-01-20 (第四次更新)
+
+**完成 Archery MCP Server 开发：**
+
+- 实现 `ArcheryClient` 类：
+  - 支持 Django Session 认证
+  - 支持 CSRF Token 处理
+  - 支持 API Token 认证（备选）
+- 实现 8 个 MCP 工具：
+  - `get_instances` - 获取数据库实例列表
+  - `get_databases` - 获取数据库列表
+  - `query_execute` - 执行只读 SQL 查询
+  - `sql_check` - SQL 语法检查
+  - `sql_review` - SQL 审核提交
+  - `get_workflow_list` - 获取工单列表
+  - `get_workflow_detail` - 获取工单详情
+  - `get_query_history` - 查询历史记录
+- 默认端口 8001（与 Kibana 8000 区分）
 
 ### 2026-01-20 (第三次更新)
 
@@ -169,12 +197,13 @@ mcp-devops-tools/
 | 问题 | 状态 | 解决方案 |
 |------|------|----------|
 | Doris 环境信息待确认 | 待解决 | 等待用户提供 |
-| Kibana 登录接口需验证 | **待测试** | 已实现，需用户配置 .env 测试 |
+| Kibana 登录接口需验证 | ✅ 已解决 | 已测试通过 |
+| Archery 需内网环境 | 待测试 | 需在内网环境测试 |
 
 ---
 
 ## 下一步行动
 
-1. **立即**: 配置 `.env` 文件并测试 Kibana MCP Server
-2. **接下来**: 在 Claude Code 中注册 MCP Server
-3. **之后**: 实现 Archery MCP Server
+1. **立即**: 在内网环境测试 Archery MCP Server
+2. **接下来**: 实现 Doris MCP Server（待确认环境信息）
+3. **之后**: 完善自动化集成

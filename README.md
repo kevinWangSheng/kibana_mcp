@@ -63,6 +63,48 @@ search_logs(index="logs-*", start_time="2024-01-19T19:00:00+08:00", end_time="20
 | `trace_id` | string | ❌ | 按链路追踪 ID 过滤 |
 | `namespace` | string | ❌ | 按 K8s 命名空间过滤 |
 
+## Archery MCP 工具列表
+
+| 工具 | 功能 | 推荐场景 |
+|------|------|----------|
+| `get_instances` | 列出数据库实例 | **AI 首先调用**，发现可用的数据库实例 |
+| `get_databases` | 列出数据库 | 获取实例下的数据库列表 |
+| `query_execute` | 执行只读查询 | **推荐使用**，执行 SELECT 查询 |
+| `sql_check` | SQL 语法检查 | 检查 SQL 语法和优化建议 |
+| `sql_review` | SQL 审核提交 | 提交 DDL/DML 工单 |
+| `get_workflow_list` | 获取工单列表 | 查看 SQL 审核工单 |
+| `get_workflow_detail` | 获取工单详情 | 查看工单详细信息 |
+| `get_query_history` | 查询历史 | 查看 SQL 执行历史 |
+
+### AI 推荐使用流程
+
+```
+1. 调用 get_instances() 获取可用数据库实例
+2. 调用 get_databases(instance_name="xxx") 获取数据库列表
+3. 调用 query_execute(sql_content="SELECT ...", instance_name="xxx", db_name="xxx") 执行查询
+```
+
+### query_execute 参数说明
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `sql_content` | string | ✅ | SQL SELECT 语句（仅支持只读查询） |
+| `instance_name` | string | ✅ | 数据库实例名（从 get_instances 获取） |
+| `db_name` | string | ✅ | 数据库名（从 get_databases 获取） |
+| `limit` | int | ❌ | 返回行数限制，默认 100，最大 1000 |
+
+**示例：**
+
+```python
+# 查询用户表
+query_execute(
+    sql_content="SELECT * FROM users WHERE status = 1",
+    instance_name="prod-mysql-master",
+    db_name="user_db",
+    limit=50
+)
+```
+
 ## 快速开始
 
 ### 1. 安装依赖
@@ -81,8 +123,11 @@ cp .env.example .env
 ### 3. 启动 MCP Server
 
 ```bash
-# 启动 Kibana MCP Server
+# 启动 Kibana MCP Server (端口 8000)
 python -m servers.kibana
+
+# 启动 Archery MCP Server (端口 8001)
+python -m servers.archery
 
 # 或启动所有服务
 python -m main
@@ -91,7 +136,11 @@ python -m main
 ### 4. 在 Claude Code 中注册
 
 ```bash
+# 注册 Kibana MCP
 claude mcp add --transport http kibana http://localhost:8000/mcp
+
+# 注册 Archery MCP
+claude mcp add --transport http archery http://localhost:8001/mcp
 ```
 
 ### 5. 使用
@@ -99,6 +148,8 @@ claude mcp add --transport http kibana http://localhost:8000/mcp
 ```
 > 帮我查询最近1小时的错误日志
 > 搜索包含 "NullPointerException" 的日志
+> 用 Archery 查询 user_db 的用户表
+> 审核这个 SQL: ALTER TABLE users ADD COLUMN phone VARCHAR(20)
 ```
 
 ## 项目结构
