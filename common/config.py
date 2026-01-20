@@ -43,17 +43,17 @@ class ArcheryConfig:
 
 @dataclass
 class DorisConfig:
-    """Doris configuration"""
-    host: str
-    port: int
-    username: str
+    """Doris/Ops-Cloud configuration for historical log queries"""
+    url: str  # Ops-Cloud API URL
+    token: str  # JWT access token
+    username: str  # For login if token expires
     password: str
 
     @classmethod
     def from_env(cls) -> "DorisConfig":
         return cls(
-            host=os.getenv("DORIS_HOST", ""),
-            port=int(os.getenv("DORIS_PORT", "9030")),
+            url=os.getenv("DORIS_URL", ""),
+            token=os.getenv("DORIS_TOKEN", ""),
             username=os.getenv("DORIS_USERNAME", ""),
             password=os.getenv("DORIS_PASSWORD", "")
         )
@@ -79,4 +79,6 @@ class Config:
 
     def validate_doris(self) -> bool:
         """Check if Doris config is valid"""
-        return bool(self.doris.host and self.doris.username and self.doris.password)
+        # Either token or username/password is required
+        has_auth = bool(self.doris.token) or bool(self.doris.username and self.doris.password)
+        return bool(self.doris.url and has_auth)

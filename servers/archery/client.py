@@ -65,6 +65,21 @@ class ArcheryClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
+        # Disable proxy for internal domains
+        # This is needed when system proxy is set but internal domains should bypass it
+        from urllib.parse import urlparse
+        parsed = urlparse(base_url)
+        if parsed.hostname and (
+            parsed.hostname.endswith('.internal') or
+            parsed.hostname.endswith('.local') or
+            parsed.hostname.startswith('192.168.') or
+            parsed.hostname.startswith('10.') or
+            parsed.hostname == 'localhost'
+        ):
+            self.session.trust_env = False
+            self.session.proxies = {'http': None, 'https': None}
+            logger.debug(f"Proxy disabled for internal host: {parsed.hostname}")
+
         # Disable SSL warnings if not verifying
         if not verify_ssl:
             import urllib3
@@ -232,28 +247,75 @@ class ArcheryClient:
         """
         Get list of database instances.
 
+        First tries the API endpoint, then falls back to extracting from query log.
+
         Args:
             db_type: Filter by database type (mysql, mssql, oracle, etc.)
 
         Returns:
             List of instance dictionaries
         """
-        params = {}
-        if db_type:
-            params['db_type'] = db_type
+        self.ensure_authenticated()
 
-        result = self._api_request('GET', '/api/v1/instance/', params=params)
+        # Try API endpoint first
+        try:
+            params = {}
+            if db_type:
+                params['db_type'] = db_type
+            result = self._api_request('GET', '/api/v1/instance/', params=params)
+            if isinstance(result, list):
+                return result
+            elif isinstance(result, dict):
+                instances = result.get('data', result.get('results', []))
+                if instances:
+                    return instances
+        except ArcheryQueryError:
+            pass
 
-        # Handle different response formats
-        if isinstance(result, list):
-            return result
-        elif isinstance(result, dict):
-            return result.get('data', result.get('results', []))
+        # Fallback: extract instances from query log
+        return self._get_instances_from_querylog()
+
+    def _get_instances_from_querylog(self) -> List[Dict]:
+        """Extract unique instances from query log history."""
+        url = f"{self.base_url}/query/querylog/?limit=500&offset=0"
+        headers = {
+            'X-CSRFToken': self._get_csrf_token(),
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{self.base_url}/sqlquery/',
+        }
+
+        try:
+            resp = self.session.get(url, headers=headers, verify=self.verify_ssl)
+            if resp.status_code == 200:
+                data = resp.json()
+                instances = {}
+                for row in data.get('rows', []):
+                    inst_name = row.get('instance_name', '')
+                    db_name = row.get('db_name', '')
+                    if inst_name:
+                        if inst_name not in instances:
+                            instances[inst_name] = {'instance_name': inst_name, 'databases': set()}
+                        if db_name:
+                            instances[inst_name]['databases'].add(db_name)
+
+                # Convert to list format
+                result = []
+                for inst_name, info in instances.items():
+                    result.append({
+                        'instance_name': inst_name,
+                        'databases': list(info['databases'])
+                    })
+                return result
+        except Exception as e:
+            logger.warning(f"Failed to get instances from querylog: {e}")
+
         return []
 
     def get_databases(self, instance_name: str) -> List[str]:
         """
         Get list of databases for an instance.
+
+        First tries the API endpoint, then falls back to extracting from query log.
 
         Args:
             instance_name: Name of the database instance
@@ -261,15 +323,60 @@ class ArcheryClient:
         Returns:
             List of database names
         """
-        result = self._api_request(
-            'GET',
-            '/api/v1/instance/databases/',
-            params={'instance_name': instance_name}
-        )
+        self.ensure_authenticated()
 
-        if isinstance(result, dict):
-            return result.get('data', result.get('databases', []))
-        return result if isinstance(result, list) else []
+        # Try API endpoint first
+        try:
+            result = self._api_request(
+                'GET',
+                '/api/v1/instance/databases/',
+                params={'instance_name': instance_name}
+            )
+            if isinstance(result, dict):
+                dbs = result.get('data', result.get('databases', []))
+                if dbs:
+                    return dbs
+            elif isinstance(result, list) and result:
+                return result
+        except ArcheryQueryError:
+            pass
+
+        # Fallback: extract from query log
+        instances = self._get_instances_from_querylog()
+        for inst in instances:
+            if inst.get('instance_name') == instance_name:
+                return inst.get('databases', [])
+
+        return []
+
+    def get_query_log(self, limit: int = 50, offset: int = 0) -> Dict:
+        """
+        Get SQL query execution history.
+
+        Args:
+            limit: Maximum records to return (default 50)
+            offset: Offset for pagination (default 0)
+
+        Returns:
+            Dict with total count and query log rows
+        """
+        self.ensure_authenticated()
+
+        url = f"{self.base_url}/query/querylog/?limit={limit}&offset={offset}"
+        headers = {
+            'X-CSRFToken': self._get_csrf_token(),
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{self.base_url}/sqlquery/',
+        }
+
+        try:
+            resp = self.session.get(url, headers=headers, verify=self.verify_ssl)
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                raise ArcheryQueryError(f"Failed to get query log: status {resp.status_code}")
+        except requests.RequestException as e:
+            raise ArcheryQueryError(f"Query log request failed: {e}")
 
     def sql_check(
         self,
@@ -333,12 +440,15 @@ class ArcheryClient:
         limit: int = 100
     ) -> Dict:
         """
-        Execute a read-only SQL query.
+        Execute a read-only query.
 
-        IMPORTANT: Only SELECT queries are allowed for safety.
+        Supports multiple database types:
+        - MySQL/TiDB/PostgreSQL: SELECT statements, SHOW commands
+        - MongoDB: db.collection.find(), db.collection.aggregate(), etc.
+        - Redis: GET, KEYS, HGETALL, etc.
 
         Args:
-            sql_content: SQL SELECT statement
+            sql_content: Query statement (syntax depends on database type)
             instance_name: Target instance name
             db_name: Target database name
             limit: Maximum rows to return (default 100)
@@ -346,31 +456,59 @@ class ArcheryClient:
         Returns:
             Query result with columns and rows
         """
-        # Safety check: only allow SELECT queries
-        sql_upper = sql_content.strip().upper()
-        if not sql_upper.startswith('SELECT'):
-            raise ArcheryQueryError(
-                "Only SELECT queries are allowed. "
-                "For DDL/DML operations, please use sql_review to submit a workflow."
-            )
+        self.ensure_authenticated()
 
-        # Add LIMIT if not present
-        if 'LIMIT' not in sql_upper:
-            sql_content = f"{sql_content.rstrip(';')} LIMIT {limit}"
+        # Detect query type and validate
+        sql_stripped = sql_content.strip()
+        sql_upper = sql_stripped.upper()
+
+        # Check for dangerous operations (basic safety)
+        dangerous_keywords = ['DROP', 'DELETE', 'TRUNCATE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE']
+        # Only check for SQL databases, not MongoDB/Redis
+        is_mongodb = sql_stripped.startswith('db.')
+        is_redis = any(sql_upper.startswith(cmd) for cmd in ['GET ', 'SET ', 'KEYS ', 'HGET', 'SCAN '])
+
+        if not is_mongodb and not is_redis:
+            for keyword in dangerous_keywords:
+                if sql_upper.startswith(keyword):
+                    raise ArcheryQueryError(
+                        f"Dangerous operation '{keyword}' not allowed. "
+                        "For DDL/DML operations, please use sql_review to submit a workflow."
+                    )
+
+        # For SQL databases, add LIMIT if it's a SELECT and no LIMIT present
+        if sql_upper.startswith('SELECT') and 'LIMIT' not in sql_upper:
+            sql_content = f"{sql_stripped.rstrip(';')} LIMIT {limit}"
+
+        # Use the web query endpoint (works with session auth)
+        url = f"{self.base_url}/query/"
+        headers = {
+            'X-CSRFToken': self._get_csrf_token(),
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{self.base_url}/sqlquery/',
+        }
 
         data = {
-            'sql_content': sql_content,
             'instance_name': instance_name,
             'db_name': db_name,
+            'sql_content': sql_content,
             'limit_num': limit
         }
 
-        # Try different API endpoints
         try:
-            return self._api_request('POST', '/api/v1/query/', data=data)
-        except ArcheryQueryError:
-            # Fallback to alternative endpoint
-            return self._api_request('POST', '/query/execute/', data=data)
+            resp = self.session.post(url, data=data, headers=headers, verify=self.verify_ssl)
+
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get('status') == 0:
+                    return result.get('data', {})
+                else:
+                    raise ArcheryQueryError(result.get('msg', 'Query failed'))
+            else:
+                raise ArcheryQueryError(f"Query failed with status {resp.status_code}")
+
+        except requests.RequestException as e:
+            raise ArcheryQueryError(f"Query request failed: {e}")
 
     def get_workflow_list(
         self,
