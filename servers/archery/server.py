@@ -444,6 +444,218 @@ def get_query_history(
         }, ensure_ascii=False)
 
 
+@mcp.tool()
+def get_resource_groups() -> str:
+    """
+    Get list of available resource groups for workflow submission.
+
+    Call this FIRST when submitting a workflow to know which groups are available.
+
+    Returns:
+        JSON string with list of resource group names
+
+    Example:
+        get_resource_groups()
+    """
+    try:
+        client = get_client()
+        groups = client.get_resource_groups()
+
+        return json.dumps({
+            'success': True,
+            'count': len(groups),
+            'groups': groups
+        }, ensure_ascii=False, indent=2)
+
+    except (ArcheryAuthError, ArcheryQueryError) as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("Unexpected error in get_resource_groups")
+        return json.dumps({
+            'success': False,
+            'error': f"Unexpected error: {str(e)}"
+        }, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_group_instances(group_name: str) -> str:
+    """
+    Get instances available for a specific resource group.
+
+    Call this after get_resource_groups() to see which instances are available.
+
+    Args:
+        group_name: Resource group name (from get_resource_groups)
+
+    Returns:
+        JSON string with list of instances (id, type, db_type, instance_name)
+
+    Example:
+        get_group_instances(group_name="TiDB")
+    """
+    try:
+        client = get_client()
+        instances = client.get_group_instances(group_name)
+
+        return json.dumps({
+            'success': True,
+            'group_name': group_name,
+            'count': len(instances),
+            'instances': instances
+        }, ensure_ascii=False, indent=2)
+
+    except (ArcheryAuthError, ArcheryQueryError) as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("Unexpected error in get_group_instances")
+        return json.dumps({
+            'success': False,
+            'error': f"Unexpected error: {str(e)}"
+        }, ensure_ascii=False)
+
+
+@mcp.tool()
+def check_sql(
+    instance_name: str,
+    db_name: str,
+    sql_content: str,
+    group_name: str = "TiDB"
+) -> str:
+    """
+    Check SQL syntax and get audit result before submitting workflow.
+
+    Use this to validate DDL/DML statements before creating a workflow.
+
+    Args:
+        instance_name: Instance name (from get_group_instances)
+        db_name: Target database name
+        sql_content: SQL content to check (DDL/DML)
+        group_name: Resource group name (default: TiDB)
+
+    Returns:
+        JSON string with check result including errors and warnings
+
+    Example:
+        check_sql(
+            instance_name="cepf-tidb",
+            db_name="cepf_order",
+            sql_content="ALTER TABLE orders ADD COLUMN remark VARCHAR(200);",
+            group_name="TiDB"
+        )
+    """
+    try:
+        client = get_client()
+
+        # Get instance ID
+        instances = client.get_group_instances(group_name)
+        instance = next((i for i in instances if i['instance_name'] == instance_name), None)
+        if not instance:
+            return json.dumps({
+                'success': False,
+                'error': f"Instance '{instance_name}' not found in group '{group_name}'"
+            }, ensure_ascii=False)
+
+        result = client.check_sql_for_workflow(instance['id'], db_name, sql_content)
+
+        return json.dumps({
+            'success': True,
+            'is_critical': result.get('is_critical', False),
+            'error_count': result.get('error_count', 0),
+            'warning_count': result.get('warning_count', 0),
+            'check_result': result
+        }, ensure_ascii=False, indent=2, default=str)
+
+    except (ArcheryAuthError, ArcheryQueryError) as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("Unexpected error in check_sql")
+        return json.dumps({
+            'success': False,
+            'error': f"Unexpected error: {str(e)}"
+        }, ensure_ascii=False)
+
+
+@mcp.tool()
+def submit_workflow(
+    workflow_name: str,
+    group_name: str,
+    instance_name: str,
+    db_name: str,
+    sql_content: str,
+    is_backup: bool = True,
+    demand_url: str = ''
+) -> str:
+    """
+    Submit SQL workflow for review (creates a ticket).
+
+    Use this for DDL/DML operations that need approval.
+    The workflow will go through the approval process before execution.
+
+    IMPORTANT: Call get_resource_groups() and get_group_instances() first to
+    get valid group and instance names.
+
+    Args:
+        workflow_name: Name/title for the workflow (e.g., "Add remark column to orders table")
+        group_name: Resource group name (from get_resource_groups)
+        instance_name: Instance name (from get_group_instances)
+        db_name: Target database name
+        sql_content: SQL content (DDL/DML statements, NOT SELECT)
+        is_backup: Whether to backup before execution (default True)
+        demand_url: Optional demand/ticket URL for reference
+
+    Returns:
+        JSON string with submission result
+
+    Example:
+        submit_workflow(
+            workflow_name="Add remark column to orders",
+            group_name="TiDB",
+            instance_name="cepf-tidb",
+            db_name="cepf_order",
+            sql_content="ALTER TABLE orders ADD COLUMN remark VARCHAR(200);",
+            is_backup=True
+        )
+    """
+    try:
+        client = get_client()
+        result = client.submit_workflow(
+            workflow_name=workflow_name,
+            group_name=group_name,
+            instance_name=instance_name,
+            db_name=db_name,
+            sql_content=sql_content,
+            is_backup=is_backup,
+            demand_url=demand_url
+        )
+
+        return json.dumps({
+            'success': True,
+            'workflow_name': workflow_name,
+            'result': result
+        }, ensure_ascii=False, indent=2, default=str)
+
+    except (ArcheryAuthError, ArcheryQueryError) as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("Unexpected error in submit_workflow")
+        return json.dumps({
+            'success': False,
+            'error': f"Unexpected error: {str(e)}"
+        }, ensure_ascii=False)
+
+
 # Main entry point
 if __name__ == "__main__":
     import sys

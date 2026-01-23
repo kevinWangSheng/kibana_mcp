@@ -583,3 +583,435 @@ class ArcheryClient:
         if isinstance(result, dict):
             return result.get('data', result.get('results', []))
         return result if isinstance(result, list) else []
+
+    def get_resource_groups(self) -> List[str]:
+        """
+        Get list of available resource groups.
+
+        Returns:
+            List of resource group names
+        """
+        self.ensure_authenticated()
+
+        # Get groups from the submit page
+        resp = self.session.get(
+            f'{self.base_url}/submitsql/',
+            verify=self.verify_ssl
+        )
+
+        if resp.status_code != 200:
+            raise ArcheryQueryError(f"Failed to get resource groups: {resp.status_code}")
+
+        import re
+        group_section = re.search(r'id="group_name"[^>]*>(.*?)</select>', resp.text, re.DOTALL)
+        if group_section:
+            options = re.findall(r'value="([^"]+)"[^>]*>([^<]+)</option>', group_section.group(1))
+            return [name for val, name in options if val and val != 'is-empty']
+
+        return []
+
+    def get_group_instances(self, group_name: str) -> List[Dict]:
+        """
+        Get instances available for a resource group.
+
+        Args:
+            group_name: Resource group name
+
+        Returns:
+            List of instance dictionaries with id, type, db_type, instance_name
+        """
+        self.ensure_authenticated()
+
+        headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRFToken': self._get_csrf_token(),
+        }
+
+        resp = self.session.post(
+            f'{self.base_url}/group/instances/',
+            data={'group_name': group_name},
+            headers=headers,
+            verify=self.verify_ssl
+        )
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                if data.get('status') == 0:
+                    return data.get('data', [])
+            except:
+                pass
+
+        raise ArcheryQueryError(f"Failed to get instances for group {group_name}")
+
+    def check_sql_for_workflow(
+        self,
+        instance_id: int,
+        db_name: str,
+        sql_content: str
+    ) -> Dict:
+        """
+        Check SQL before submitting workflow.
+
+        Args:
+            instance_id: Instance ID (from get_group_instances)
+            db_name: Database name
+            sql_content: SQL content (DDL/DML)
+
+        Returns:
+            Check result with errors/warnings
+        """
+        self.ensure_authenticated()
+
+        headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRFToken': self._get_csrf_token(),
+            'Content-Type': 'application/json',
+        }
+
+        data = {
+            'instance_id': instance_id,
+            'db_name': db_name,
+            'full_sql': sql_content,
+        }
+
+        resp = self.session.post(
+            f'{self.base_url}/api/v1/workflow/sqlcheck/',
+            json=data,
+            headers=headers,
+            verify=self.verify_ssl
+        )
+
+        if resp.status_code == 200:
+            return resp.json()
+
+        raise ArcheryQueryError(f"SQL check failed: {resp.text}")
+
+    def _get_group_id_and_name(self, group_name: str) -> tuple:
+        """Get resource group ID and actual value by name.
+
+        Returns:
+            Tuple of (group_id, group_value) where group_id is numeric and group_value is the form value
+        """
+        self.ensure_authenticated()
+
+        # Get groups from the submit page
+        resp = self.session.get(
+            f'{self.base_url}/submitsql/',
+            verify=self.verify_ssl
+        )
+
+        import re
+        # Try to find group select element and extract both value and group_id attribute
+        patterns = [
+            r'id="group_name"[^>]*>(.*?)</select>',
+            r'name="group_name"[^>]*>(.*?)</select>',
+        ]
+
+        for pattern in patterns:
+            group_section = re.search(pattern, resp.text, re.DOTALL)
+            if group_section:
+                section_html = group_section.group(1)
+
+                # Try to find options with group_id attribute
+                # Format: <option value="TiDB" group_id="6">TiDB</option>
+                options_with_attr = re.findall(
+                    r'<option[^>]*value="([^"]+)"[^>]*group_id="(\d+)"[^>]*>([^<]+)</option>',
+                    section_html
+                )
+                if options_with_attr:
+                    logger.info(f"Found groups with group_id attr: {[(v, gid, n.strip()) for v, gid, n in options_with_attr[:5]]}")
+                    for value, group_id, name in options_with_attr:
+                        if name.strip() == group_name:
+                            return int(group_id), value
+
+                # Also try reversed attribute order
+                options_with_attr = re.findall(
+                    r'<option[^>]*group_id="(\d+)"[^>]*value="([^"]+)"[^>]*>([^<]+)</option>',
+                    section_html
+                )
+                if options_with_attr:
+                    logger.info(f"Found groups (reversed): {[(gid, v, n.strip()) for gid, v, n in options_with_attr[:5]]}")
+                    for group_id, value, name in options_with_attr:
+                        if name.strip() == group_name:
+                            return int(group_id), value
+
+                # Fallback: just get value (might be numeric ID itself)
+                options = re.findall(r'value="([^"]+)"[^>]*>([^<]+)</option>', section_html)
+                logger.info(f"Found group options (no attr): {[(v, n.strip()) for v, n in options[:5]]}")
+
+                for value, name in options:
+                    if name.strip() == group_name and value and value != 'is-empty':
+                        if value.isdigit():
+                            return int(value), value
+                        # Value is not numeric, we need to find group_id elsewhere
+                        break
+
+        # Alternative: try API endpoint to get group list with IDs
+        try:
+            result = self._api_request('GET', '/group/list/')
+            if isinstance(result, dict):
+                groups = result.get('data', result.get('results', result.get('rows', [])))
+            else:
+                groups = result if isinstance(result, list) else []
+
+            for g in groups:
+                if g.get('group_name') == group_name:
+                    group_id = g.get('group_id') or g.get('id')
+                    if group_id:
+                        return int(group_id), group_name
+        except Exception as e:
+            logger.warning(f"API group lookup failed: {e}")
+
+        # Try getting groups from group management page
+        try:
+            resp = self.session.get(f'{self.base_url}/group/', verify=self.verify_ssl)
+            # Look for group table data
+            rows = re.findall(r'<tr[^>]*>.*?</tr>', resp.text, re.DOTALL)
+            for row in rows:
+                if group_name in row:
+                    id_match = re.search(r'group_id["\s:=]+(\d+)', row)
+                    if id_match:
+                        return int(id_match.group(1)), group_name
+        except Exception as e:
+            logger.warning(f"Group page lookup failed: {e}")
+
+        raise ArcheryQueryError(f"Resource group '{group_name}' not found - could not determine group_id")
+
+    def submit_workflow(
+        self,
+        workflow_name: str,
+        group_name: str,
+        instance_name: str,
+        db_name: str,
+        sql_content: str,
+        is_backup: bool = True,
+        demand_url: str = ''
+    ) -> Dict:
+        """
+        Submit SQL workflow for review.
+
+        This is used for DDL/DML operations that need approval.
+        SELECT queries should use query_execute() instead.
+
+        Args:
+            workflow_name: Name/title of the workflow
+            group_name: Resource group name (from get_resource_groups)
+            instance_name: Instance name (from get_group_instances)
+            db_name: Target database name
+            sql_content: SQL content (DDL/DML statements)
+            is_backup: Whether to backup before execution (default True)
+            demand_url: Optional demand/ticket URL
+
+        Returns:
+            Workflow submission result
+        """
+        self.ensure_authenticated()
+
+        # Get instance ID and group ID
+        instances = self.get_group_instances(group_name)
+        instance = next((i for i in instances if i['instance_name'] == instance_name), None)
+        if not instance:
+            raise ArcheryQueryError(f"Instance '{instance_name}' not found in group '{group_name}'")
+
+        instance_id = instance['id']
+
+        # Get numeric group_id
+        group_id = self._get_group_id_from_page(group_name)
+        logger.info(f"Submitting workflow: group_name={group_name}, group_id={group_id}, instance_id={instance_id}")
+
+        # Check SQL first
+        check_result = self.check_sql_for_workflow(instance_id, db_name, sql_content)
+        if check_result.get('is_critical'):
+            raise ArcheryQueryError(f"SQL check failed with critical errors: {check_result}")
+
+        # Try REST API first (Archery >= 1.9)
+        try:
+            return self._submit_workflow_api(
+                workflow_name, group_id, instance_id, db_name,
+                sql_content, is_backup, demand_url
+            )
+        except Exception as e:
+            logger.warning(f"REST API submission failed: {e}, trying form submission")
+
+        # Fallback to form submission
+        return self._submit_workflow_form(
+            workflow_name, group_name, group_name, instance_name, instance_id,
+            db_name, sql_content, is_backup, demand_url
+        )
+
+    def _get_group_id_from_page(self, group_name: str) -> int:
+        """Get numeric group_id from submitsql page HTML.
+
+        The submitsql page contains option elements with group-id attribute:
+        <option value="TiDB" group-id="6">TiDB</option>
+        """
+        self.ensure_authenticated()
+
+        import re
+
+        # Method 1: Parse submitsql page for group-id attribute (most reliable)
+        try:
+            resp = self.session.get(f'{self.base_url}/submitsql/', verify=self.verify_ssl)
+            if resp.status_code == 200:
+                # Look for group_name select and extract group-id attributes
+                # Format: <option value="TiDB" group-id="6">TiDB</option>
+
+                # Match: value="X" followed by group-id="N"
+                pattern1 = r'<option[^>]*value="([^"]+)"[^>]*group-id="(\d+)"[^>]*>([^<]*)</option>'
+                matches = re.findall(pattern1, resp.text)
+                if matches:
+                    logger.info(f"Found {len(matches)} groups with group-id attribute")
+                    for value, group_id, text in matches:
+                        name = text.strip()
+                        if name == group_name or value == group_name:
+                            logger.info(f"Found group_id={group_id} for {group_name}")
+                            return int(group_id)
+
+                # Try reversed attribute order: group-id="N" followed by value="X"
+                pattern2 = r'<option[^>]*group-id="(\d+)"[^>]*value="([^"]+)"[^>]*>([^<]*)</option>'
+                matches = re.findall(pattern2, resp.text)
+                if matches:
+                    for group_id, value, text in matches:
+                        name = text.strip()
+                        if name == group_name or value == group_name:
+                            logger.info(f"Found group_id={group_id} for {group_name}")
+                            return int(group_id)
+        except Exception as e:
+            logger.warning(f"Submitsql page parsing failed: {e}")
+
+        # Method 2: Try /group/list/ AJAX endpoint as fallback
+        headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRFToken': self._get_csrf_token(),
+        }
+
+        for endpoint in ['/group/list/', '/group/group/']:
+            try:
+                resp = self.session.get(
+                    f'{self.base_url}{endpoint}',
+                    headers=headers,
+                    verify=self.verify_ssl
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    rows = data.get('rows', data.get('data', data.get('results', [])))
+                    if not rows and isinstance(data, list):
+                        rows = data
+                    for row in rows:
+                        if row.get('group_name') == group_name:
+                            gid = row.get('group_id') or row.get('id')
+                            logger.info(f"Found group_id={gid} for {group_name} from API")
+                            return int(gid)
+            except Exception as e:
+                logger.debug(f"Group endpoint {endpoint} failed: {e}")
+
+        raise ArcheryQueryError(f"Could not find numeric group_id for '{group_name}'")
+
+    def _submit_workflow_api(
+        self,
+        workflow_name: str,
+        group_id,  # Can be int or str (group_name)
+        instance_id: int,
+        db_name: str,
+        sql_content: str,
+        is_backup: bool,
+        demand_url: str
+    ) -> Dict:
+        """Submit workflow via REST API (Archery >= 1.9)."""
+        headers = {
+            'X-CSRFToken': self._get_csrf_token(),
+            'Content-Type': 'application/json',
+            'Referer': f'{self.base_url}/submitsql/',
+        }
+
+        data = {
+            'sql_content': sql_content,
+            'workflow': {
+                'workflow_name': workflow_name,
+                'group_id': group_id,  # May be numeric ID or group_name string
+                'instance': instance_id,
+                'db_name': db_name,
+                'is_backup': is_backup,
+                'demand_url': demand_url,
+                'is_offline_export': False,
+            }
+        }
+
+        resp = self.session.post(
+            f'{self.base_url}/api/v1/workflow/',
+            json=data,
+            headers=headers,
+            verify=self.verify_ssl
+        )
+
+        logger.info(f"API submit response: status={resp.status_code}")
+
+        if resp.status_code in (200, 201):
+            result = resp.json()
+            return {'status': 0, 'msg': 'Workflow submitted successfully', 'data': result}
+
+        raise ArcheryQueryError(f"API submission failed: {resp.status_code} - {resp.text[:500]}")
+
+    def _submit_workflow_form(
+        self,
+        workflow_name: str,
+        group_name: str,
+        group_value,  # Can be int (ID) or str (name)
+        instance_name: str,
+        instance_id: int,
+        db_name: str,
+        sql_content: str,
+        is_backup: bool,
+        demand_url: str
+    ) -> Dict:
+        """Submit workflow via form POST (legacy method)."""
+        headers = {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRFToken': self._get_csrf_token(),
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Referer': f'{self.base_url}/submitsql/',
+        }
+
+        # Use the group_value we got from the form (could be ID or name)
+        data = {
+            'workflow_name': workflow_name,
+            'group_name': group_value,  # Use the actual value from the form
+            'instance_name': instance_id,  # Archery uses instance ID here
+            'db_name': db_name,
+            'sql_content': sql_content,
+            'is_backup': '1' if is_backup else '0',
+        }
+        if demand_url:
+            data['demand_url'] = demand_url
+
+        resp = self.session.post(
+            f'{self.base_url}/submitsql/',
+            data=data,
+            headers=headers,
+            verify=self.verify_ssl
+        )
+
+        logger.info(f"Form submit response: status={resp.status_code}, url={resp.url}")
+        logger.info(f"Response text (first 2000): {resp.text[:2000]}")
+
+        if resp.status_code == 200:
+            try:
+                result = resp.json()
+                if result.get('status') == 0:
+                    return result
+                else:
+                    raise ArcheryQueryError(f"Form submission error: {result}")
+            except json.JSONDecodeError:
+                # HTML response - check for success indicators
+                if 'sqlworkflow' in resp.url or '/detail/' in resp.url:
+                    return {'status': 0, 'msg': 'Workflow submitted successfully'}
+                # Check for error messages in HTML
+                import re
+                error_match = re.search(r'<div[^>]*class="[^"]*alert[^"]*"[^>]*>(.*?)</div>', resp.text, re.DOTALL)
+                if error_match:
+                    error_msg = re.sub(r'<[^>]+>', '', error_match.group(1)).strip()
+                    raise ArcheryQueryError(f"Form submission error: {error_msg}")
+                raise ArcheryQueryError("Form submission failed: unexpected HTML response")
+
+        raise ArcheryQueryError(f"Workflow submission failed: HTTP {resp.status_code}")
